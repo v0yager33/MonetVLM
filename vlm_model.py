@@ -1,0 +1,174 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import PreTrainedModel, PretrainedConfig, AutoModelForCausalLM, AutoModel, AutoTokenizer
+from transformers.modeling_outputs import CausalLMOutputWithPast
+
+class SparkVLMConfig(PretrainedConfig):
+    model_type = "spark_vlm"
+    def __init__(self, llm_model_path="", vision_model_path="", freeze_vision_model=True, **kwargs):
+        self.vision_model_path = vision_model_path
+        self.llm_model_path = llm_model_path
+        self.freeze_vision_model = freeze_vision_model
+        super().__init__(**kwargs)
+
+class SparkVLM(PreTrainedModel):
+    config_class = SparkVLMConfig
+    def __init__(self, config):
+        super().__init__(config)
+        self.config = config
+        # 自动检测 flash_attn 是否可用，优先使用 flash_attention_2 加速
+        try:
+            import flash_attn  # noqa: F401
+            attn_impl = "flash_attention_2"
+            print(f"[SparkVLM] Flash Attention 2 detected (flash_attn=={flash_attn.__version__}), using flash_attention_2.")
+        except ImportError:
+            attn_impl = "eager"
+            print(f"[SparkVLM] flash_attn not installed, falling back to eager attention. ")
+
+        self.vision_model = AutoModel.from_pretrained(self.config.vision_model_path, torch_dtype=torch.bfloat16)
+        self.llm = AutoModelForCausalLM.from_pretrained(
+            self.config.llm_model_path,
+            torch_dtype=torch.bfloat16,
+            attn_implementation=attn_impl,
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(self.config.llm_model_path)
+
+        if '<|image_pad|>' not in self.tokenizer.get_vocab():
+            self.tokenizer.add_special_tokens({'additional_special_tokens': ['<|image_pad|>']})
+            self.llm.resize_token_embeddings(len(self.tokenizer))
+        self.image_pad_id = self.tokenizer('<|image_pad|>')['input_ids'][0]
+
+        self.vision_dim = self.vision_model.config.vision_config.hidden_size 
+        self.llm_dim = self.llm.config.hidden_size 
+
+        # 1. C-Abstractor (Patch Merger) 使用 2x2 压缩
+        self.compress_grid = 2
+        self.compress_ratio = self.compress_grid * self.compress_grid # 4
+
+        # 2 层 MLP 作为 Vision-Language 投影层
+        self.linear1 = nn.Linear(self.vision_dim * self.compress_ratio, self.llm_dim).to(torch.bfloat16)
+        self.linear2 = nn.Linear(self.llm_dim, self.llm_dim).to(torch.bfloat16)
+
+        if self.config.freeze_vision_model:
+            for param in self.vision_model.parameters():
+                param.requires_grad = False
+
+    def extract_dynamic_vision_features(self, pixel_values):
+        vision_model = self.vision_model.vision_model
+        patch_embeds = vision_model.embeddings.patch_embedding(pixel_values) 
+        B, D, H_p, W_p = patch_embeds.shape
+
+        pos_embed = vision_model.embeddings.position_embedding.weight 
+        orig_size = int(pos_embed.shape[0] ** 0.5) 
+        pos_embed_2d = pos_embed.view(1, orig_size, orig_size, D).permute(0, 3, 1, 2)
+
+        pos_embed_interp = F.interpolate(
+            pos_embed_2d.float(), 
+            size=(H_p, W_p), 
+            mode='bicubic', 
+            align_corners=False
+        ).to(pos_embed_2d.dtype)
+        pos_embed_interp = pos_embed_interp.flatten(2).transpose(1, 2)
+
+        patch_embeds = patch_embeds.flatten(2).transpose(1, 2)
+        hidden_states = patch_embeds + pos_embed_interp
+
+        seq_len = hidden_states.shape[1]
+        attention_mask = torch.ones(1, 1, seq_len, seq_len, device=hidden_states.device, dtype=hidden_states.dtype)
+        for encoder_layer in vision_model.encoder.layers:
+            hidden_states = encoder_layer(hidden_states, attention_mask=attention_mask)[0]
+
+        hidden_states = vision_model.post_layernorm(hidden_states)
+        return hidden_states, H_p, W_p
+
+    def forward(self, input_ids, labels=None, pixel_values=None, image_sizes=None, image_grid_thw=None,
+                attention_mask=None, past_key_values=None, use_cache=False, vision_features=None):
+        # Decode 阶段：有 past_key_values 时只需处理最新 token，跳过视觉编码
+        if past_key_values is not None:
+            # 确保 past_key_values 是 DynamicCache 对象（Qwen3 等新版模型要求）
+            if isinstance(past_key_values, tuple):
+                cache = DynamicCache()
+                for layer_idx, (key_states, value_states) in enumerate(past_key_values):
+                    cache.update(key_states, value_states, layer_idx)
+                past_key_values = cache
+
+            # 只取最后一个 token 的 embedding
+            text_embeds = self.llm.get_input_embeddings()(input_ids[:, -1:])
+            outputs = self.llm(
+                inputs_embeds=text_embeds,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+            )
+            logits = outputs[0]
+            new_past = outputs.past_key_values if use_cache else None
+            return CausalLMOutputWithPast(loss=None, logits=logits, past_key_values=new_past)
+
+        # Prefill 阶段：完整处理 input_ids + 视觉特征
+        text_embeds = self.llm.get_input_embeddings()(input_ids)
+
+        if vision_features is not None:
+            # 使用预计算的视觉特征（避免重复 ViT 编码）
+            text_embeds = text_embeds.to(vision_features.dtype)
+            inputs_embeds = self.merge_input_ids_with_image_features(vision_features, text_embeds, input_ids)
+        elif pixel_values is not None and image_sizes is not None:
+            B = pixel_values.shape[0]
+            all_image_features = []
+
+            for i in range(B):
+                h, w = image_sizes[i]
+                valid_pv = pixel_values[i:i+1, :, :h, :w]
+
+                image_embeds, H_p, W_p = self.extract_dynamic_vision_features(valid_pv)
+
+                # 2. C-Abstractor (Patch Merger) 2x2
+                new_h, new_w = H_p // self.compress_grid, W_p // self.compress_grid
+                image_embeds = image_embeds.view(1, H_p, W_p, -1)
+                image_embeds = image_embeds.view(1, new_h, self.compress_grid, new_w, self.compress_grid, -1)
+                image_embeds = image_embeds.permute(0, 1, 3, 2, 4, 5).contiguous()
+                image_embeds = image_embeds.view(1, new_h * new_w, -1)
+
+                feats = self.linear2(F.silu(self.linear1(image_embeds)))
+                all_image_features.append(feats.squeeze(0))
+
+            image_features = torch.cat(all_image_features, dim=0)
+            text_embeds = text_embeds.to(image_features.dtype)
+
+            inputs_embeds = self.merge_input_ids_with_image_features(image_features, text_embeds, input_ids)
+        else:
+            inputs_embeds = text_embeds
+
+        outputs = self.llm(
+            inputs_embeds=inputs_embeds, 
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+        )
+        logits = outputs[0]
+        new_past = outputs.past_key_values if use_cache else None
+
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1).to(logits.device))
+
+        return CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=new_past)
+
+    def merge_input_ids_with_image_features(self, image_features, inputs_embeds, input_ids):
+        batch_indices, image_indices = torch.where(input_ids == self.image_pad_id)
+        embed_dim = image_features.shape[-1]
+
+        if len(batch_indices) > 0:
+            if len(batch_indices) != image_features.shape[0]:
+                print(f"Warning: Token count mismatch. image_features: {image_features.shape[0]}, placeholders: {len(batch_indices)}. Truncating/Padding to match.")
+                min_len = min(len(batch_indices), image_features.shape[0])
+                batch_indices = batch_indices[:min_len]
+                image_indices = image_indices[:min_len]
+                image_features = image_features[:min_len]
+
+            inputs_embeds[batch_indices, image_indices] = image_features.to(inputs_embeds.dtype)
+
+        return inputs_embeds

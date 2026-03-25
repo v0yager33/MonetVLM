@@ -1,0 +1,7 @@
+torch==2.7.0
+transformers==4.56.2
+Pillow==10.4.0
+gradio>=4.0.0
+tensorboard==2.20.0
+tqdm==4.67.3
+#flash_attn==2.8.3
