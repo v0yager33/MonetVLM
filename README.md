@@ -89,11 +89,7 @@ CUDA_VISIBLE_DEVICES=0 python grpo_train.py \
 ```python
 from inference import load_model, generate
 
-model, processor, tokenizer = load_model(
-    model_dir="save/vlm_grpo",
-    vision_model_path="path/to/siglip2-so400m-patch14-384",
-    llm_model_path="path/to/Qwen3-1.7B",
-)
+model, processor, tokenizer = load_model(model_dir="save/vlm_grpo")
 
 response = generate(model, processor, tokenizer, "Describe this image.", image_path="pics/test_pic.jpg")
 print(response)
