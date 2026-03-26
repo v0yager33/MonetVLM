@@ -109,11 +109,8 @@ python gradio_app.py
 核心流程：
 1. 对每个 Prompt 生成 G 个回复
 2. 用奖励函数计算每个回复的奖励 R_i
-3. 组内归一化：
-$$
-A_i = \frac{R_i - \text{mean}}{\text{std}}
-$$
-5. 优势裁剪 + KL 散度惩罚
+3. 组内归一化：\$A_i = (R_i - mean) / std\$
+4. 优势裁剪 + KL 散度惩罚
 
 特性：
 - **多 Prompt 并行生成**：M 个 prompt × G 个 generation 在 Decode 阶段 batch 并行，类似 VeRL 使用了 minibatch，实际的 BS = miniBatch * 梯度累积步数
