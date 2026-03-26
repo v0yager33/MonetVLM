@@ -173,6 +173,7 @@ MonetVLM/
 - grpo 训练由于是用 torch 写的，kvcache 管理很差，也没有使用 paged attention 进行推理优化，训练时显存占用波动大
 - 异构模型评测脚本同上
 - Qwen3-vl 的 MRoPE 还未实现
+ 
 后续有人感兴趣可以进行优化
 
 ## 参考文献
