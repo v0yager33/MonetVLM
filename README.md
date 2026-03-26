@@ -6,7 +6,7 @@
   <img src="pics/monet.png" width="160" style="vertical-align: middle; margin-right: 20px;">
 </p>
 
-MonetVLM 是一个完整的 VLM 训练项目，基于 **Qwen3-1.7B** 语言模型和 **SigLIP2-SO400M**视觉编码器从零搭建，实现了从 Adapter 预训练，到联合训练，到领域微调，最后到 GRPO 强化学习对齐的全流程训练。项目以艺术画作风格识别为领域微调背景，通过 SFT + RL 将通用 VLM 适配到特定领域任务。
+MonetVLM 是一个完整的 VLM 训练项目，基于 **Qwen3-1.7B** 语言模型和 **SigLIP2-SO400M** 视觉编码器从零搭建，实现了从 Adapter 预训练，到联合训练，到领域微调，最后到 GRPO 强化学习对齐的全流程训练。项目以艺术画作风格识别为领域微调背景，通过 SFT + RL 将通用 VLM 适配到特定领域任务。
 
 <p align="center">
   <img src="pics/performance.png" width="400" style="vertical-align: middle;">
@@ -164,10 +164,17 @@ MonetVLM/
   "image_path": "/path/to/image.jpg",
   "query": "Select the correct art genre...\n<image>\n\nOptions:\nA. ...\nB. ...",
   "answer": "C",
-  "analysis": "This painting depicts...",
   "genre":"Impressionism", # 领域标签，印象派
 }
 ```
+## 目前存在问题
+- 数据量可能不太够，训完之后文本模型部分能力遗忘，出现输出乱码和指令不遵循的情况
+- 只训练了 caption 任务，ocr、grounding 这类能力近乎没有
+- grpo 训练由于是用 torch 写的，kvcache 管理很差，也没有使用 paged attention 进行推理优化，训练时显存占用波动大
+- 异构模型评测脚本同上
+- Qwen3-vl 的 MRoPE 还未实现
+后续有人感兴趣可以进行优化
+
 ## 参考文献
 - DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models, https://arxiv.org/abs/2402.03300
 - Qwen3 Technical Report, https://arxiv.org/abs/2505.09388
